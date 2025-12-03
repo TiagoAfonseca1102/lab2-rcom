@@ -71,7 +71,7 @@ int parseURL(const char *url, URLInfo *info) {
     return 0;
 }
 
-// Reused from getip.c - Function to get IP address from hostname
+// Reused getip.c - Function to get IP address from hostname
 int getIPAddress(const char *hostname, char *ip) {
     struct hostent *h;
     
@@ -91,19 +91,19 @@ int connectToServer(const char *ip, int port) {
     int sockfd;
     struct sockaddr_in server_addr;
     
-    /*server address handling*/
+    // server address handling
     bzero((char *)&server_addr, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = inet_addr(ip);    /*32 bit Internet address network byte ordered*/
-    server_addr.sin_port = htons(port);              /*server TCP port must be network byte ordered */
+    server_addr.sin_addr.s_addr = inet_addr(ip);    // 32 bit Internet address network byte ordered
+    server_addr.sin_port = htons(port);              // server TCP port must be network byte ordered 
     
-    /*open a TCP socket*/
+    // open a TCP socket
     if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("socket()");
         return -1;
     }
     
-    /*connect to the server*/
+    // connect to the server
     if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("connect()");
         close(sockfd);
@@ -115,32 +115,56 @@ int connectToServer(const char *ip, int port) {
 
 // Function to read FTP response
 int readResponse(int sockfd, char *buffer, int size) {
-    int bytes = 0;
-    int total = 0;
-    char c;
-    
     memset(buffer, 0, size);
+    int total = 0;
+    char line[MAX_BUFFER];
+    int code = 0;
+    int first_line = 1;
     
-    // Read until we get a complete response
-    // FTP responses end with code + space + text + CRLF
-    while (total < size - 1) {
-        bytes = read(sockfd, &c, 1);
-        if (bytes <= 0) break;
+    while (1) {
+        int i = 0;
+        char c;
         
-        buffer[total++] = c;
-        
-        // Check if we have a complete line
-        if (total >= 2 && buffer[total-2] == '\r' && buffer[total-1] == '\n') {
-            // Check if this is the final line (code followed by space)
-            if (total >= 4 && buffer[3] == ' ') {
+        // Read one line at a time
+        while (i < MAX_BUFFER - 1) {
+            int n = read(sockfd, &c, 1);
+            if (n <= 0) {
+                if (total > 0) return total;
+                return -1;
+            }
+            
+            line[i++] = c;
+            
+            // Check for end of line 
+            if (i >= 2 && line[i-2] == '\r' && line[i-1] == '\n') {
+                line[i] = '\0';
                 break;
             }
         }
+        
+        // Add line to buffer
+        if (total + i < size) {
+            strcat(buffer, line);
+            total += i;
+        }
+        
+        // Parse response code from first line
+        if (first_line && i >= 3) {
+            code = (line[0] - '0') * 100 + (line[1] - '0') * 10 + (line[2] - '0');
+            first_line = 0;
+        }
+        
+        // Check if this is the last line
+        // Last line format: "XXX " (code + space)
+        if (i >= 4 && line[0] == (code/100 + '0') && 
+            line[1] == ((code/10)%10 + '0') && 
+            line[2] == (code%10 + '0') && 
+            line[3] == ' ') {
+            break;
+        }
     }
     
-    buffer[total] = '\0';
     printf("< %s", buffer);
-    
     return total;
 }
 
@@ -157,7 +181,7 @@ int sendCommand(int sockfd, const char *cmd, const char *arg) {
     
     printf("> %s", buffer);
     
-    /*send command to the server*/
+    // send command to the server
     bytes = write(sockfd, buffer, strlen(buffer));
     if (bytes > 0) {
         // Command sent successfully
@@ -288,6 +312,14 @@ int main(int argc, char **argv) {
         close(control_sock);
         exit(-1);
     }
+    // Set binary mode
+    printf("\n--- Setting Binary Mode ---\n");
+    sendCommand(control_sock, "TYPE", "I");
+    readResponse(control_sock, buffer, sizeof(buffer));
+    if (buffer[0] != '2') {
+        fprintf(stderr, "Warning: Failed to set binary mode\n");
+        // continue (most dont need)
+    }
     
     // Enter passive mode
     printf("\n--- Entering Passive Mode ---\n");
@@ -351,7 +383,7 @@ int main(int argc, char **argv) {
         exit(-1);
     }
     
-    printf("\n=== Download Successful ===\n");
+    printf("\n Download Successful \n");
     
     return 0;
 }
