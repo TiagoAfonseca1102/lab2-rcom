@@ -347,7 +347,7 @@ int main(int argc, char **argv) {
         exit(-1);
     }
     
-    // autenticaÃ§Ã£o
+    // autenticação
     printf("\n--- Authentication ---\n");
     
     // Send USER command
