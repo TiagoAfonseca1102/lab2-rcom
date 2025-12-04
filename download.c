@@ -6,17 +6,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include "download.h"
 
-#define MAX_BUFFER 1024
-#define FTP_PORT 21
-
-// Structure to store parsed URL information
-typedef struct {
-    char user[128];
-    char password[128];
-    char host[256];
-    char path[512];
-} URLInfo;
 
 // Function to parse FTP URL
 // Format: ftp://[user:password@]host/path
@@ -62,16 +53,36 @@ int parseURL(const char *url, URLInfo *info) {
         strcpy(info->path, "");
     }
     
+    // Separate directory and filename
+    char *last_slash = strrchr(info->path, '/');
+    if (last_slash != NULL && last_slash != info->path) {
+        // Has directory
+        size_t dir_len = last_slash - info->path;
+        strncpy(info->directory, info->path, dir_len);
+        info->directory[dir_len] = '\0';
+        strcpy(info->filename, last_slash + 1);
+    } else {
+        // No directory, just filename
+        strcpy(info->directory, "");
+        if (strlen(info->path) > 0) {
+            strcpy(info->filename, info->path);
+        } else {
+            strcpy(info->filename, "");
+        }
+    }
+    
     printf("Parsed URL:\n");
-    printf("  User: %s\n", info->user);
-    printf("  Password: %s\n", info->password);
-    printf("  Host: %s\n", info->host);
-    printf("  Path: %s\n", info->path);
+    printf("User: %s\n", info->user);
+    printf("Password: %s\n", info->password);
+    printf("Host: %s\n", info->host);
+    printf("Path: %s\n", info->path);
+    printf("Directory: %s\n", info->directory);
+    printf("Filename: %s\n", info->filename);
     
     return 0;
 }
 
-// Reused getip.c - Function to get IP address from hostname
+// get IP address from hostname
 int getIPAddress(const char *hostname, char *ip) {
     struct hostent *h;
     
@@ -86,7 +97,7 @@ int getIPAddress(const char *hostname, char *ip) {
     return 0;
 }
 
-// Reused and adapted from clientTCP.c - Function to connect to server
+// Function to connect to server
 int connectToServer(const char *ip, int port) {
     int sockfd;
     struct sockaddr_in server_addr;
@@ -94,8 +105,8 @@ int connectToServer(const char *ip, int port) {
     // server address handling
     bzero((char *)&server_addr, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = inet_addr(ip);    // 32 bit Internet address network byte ordered
-    server_addr.sin_port = htons(port);              // server TCP port must be network byte ordered 
+    server_addr.sin_addr.s_addr = inet_addr(ip);
+    server_addr.sin_port = htons(port);
     
     // open a TCP socket
     if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
@@ -113,7 +124,8 @@ int connectToServer(const char *ip, int port) {
     return sockfd;
 }
 
-// Function to read FTP response
+// Function to read FTP response 
+// Returns the response code
 int readResponse(int sockfd, char *buffer, int size) {
     memset(buffer, 0, size);
     int total = 0;
@@ -129,7 +141,7 @@ int readResponse(int sockfd, char *buffer, int size) {
         while (i < MAX_BUFFER - 1) {
             int n = read(sockfd, &c, 1);
             if (n <= 0) {
-                if (total > 0) return total;
+                if (total > 0) return code;
                 return -1;
             }
             
@@ -142,7 +154,7 @@ int readResponse(int sockfd, char *buffer, int size) {
             }
         }
         
-        // Add line to buffer
+        // Add line to the buffer
         if (total + i < size) {
             strcat(buffer, line);
             total += i;
@@ -155,7 +167,7 @@ int readResponse(int sockfd, char *buffer, int size) {
         }
         
         // Check if this is the last line
-        // Last line format: "XXX " (code + space)
+        // Last line format: "XXX " code + space
         if (i >= 4 && line[0] == (code/100 + '0') && 
             line[1] == ((code/10)%10 + '0') && 
             line[2] == (code%10 + '0') && 
@@ -165,15 +177,32 @@ int readResponse(int sockfd, char *buffer, int size) {
     }
     
     printf("< %s", buffer);
-    return total;
+    return code;
 }
 
-// Function to send FTP command
+// check if response code indicates success
+int isSuccessCode(int code) {
+    return (code >= 200 && code < 300);
+}
+
+// check if response code indicates error
+int isErrorCode(int code) {
+    return (code >= 400);
+}
+
+// get error message based on code
+const char* getErrorMessage(int code) {
+    if (code >= 500) return "Permanent error";
+    if (code >= 400) return "Temporary error";
+    return "Unknown error";
+}
+
+// send FTP command
 int sendCommand(int sockfd, const char *cmd, const char *arg) {
     char buffer[MAX_BUFFER];
     size_t bytes;
     
-    if (arg != NULL) {
+    if (arg != NULL && strlen(arg) > 0) {
         snprintf(buffer, sizeof(buffer), "%s %s\r\n", cmd, arg);
     } else {
         snprintf(buffer, sizeof(buffer), "%s\r\n", cmd);
@@ -181,11 +210,8 @@ int sendCommand(int sockfd, const char *cmd, const char *arg) {
     
     printf("> %s", buffer);
     
-    // send command to the server
     bytes = write(sockfd, buffer, strlen(buffer));
-    if (bytes > 0) {
-        // Command sent successfully
-    } else {
+    if (bytes != strlen(buffer)) {
         perror("write()");
         return -1;
     }
@@ -193,7 +219,28 @@ int sendCommand(int sockfd, const char *cmd, const char *arg) {
     return 0;
 }
 
-// Function to parse PASV response to get IP and port
+// change working directory (CWD command)
+int sendCommandCWD(int sockfd, const char *dir) {
+    char buffer[MAX_BUFFER];
+    char cmd[MAX_BUFFER];
+    
+    snprintf(cmd, sizeof(cmd), "CWD %s\r\n", dir);
+    
+    printf("> CWD %s\n", dir);
+    
+    // Send command
+    if (write(sockfd, cmd, strlen(cmd)) < 0) {
+        perror("write()");
+        return -1;
+    }
+    
+    // Read response
+    int code = readResponse(sockfd, buffer, sizeof(buffer));
+    
+    return code;
+}
+
+// parse PASV response to get IP and port
 int parsePasvResponse(const char *response, char *ip, int *port) {
     int ip1, ip2, ip3, ip4, port1, port2;
     char *start;
@@ -219,14 +266,14 @@ int parsePasvResponse(const char *response, char *ip, int *port) {
     return 0;
 }
 
-// Function to download file
+// download file
 int downloadFile(int sockfd, const char *filename) {
     char buffer[MAX_BUFFER];
     int bytes;
     FILE *file;
     int total = 0;
     
-    // Extract just the filename for saving
+    // Extract filename for saving
     const char *name = strrchr(filename, '/');
     if (name != NULL) {
         name++;
@@ -247,7 +294,7 @@ int downloadFile(int sockfd, const char *filename) {
     
     printf("Downloading to file: %s\n", name);
     
-    // Read data and write to file (similar to clientTCP read pattern)
+    // Read data and write to file
     while ((bytes = read(sockfd, buffer, sizeof(buffer))) > 0) {
         fwrite(buffer, 1, bytes, file);
         total += bytes;
@@ -266,11 +313,12 @@ int main(int argc, char **argv) {
     char buffer[MAX_BUFFER];
     char data_ip[32];
     int data_port;
+    int code;
     
     // Check arguments
     if (argc != 2) {
         fprintf(stderr, "Usage: %s ftp://[user:password@]host/path\n", argv[0]);
-        fprintf(stderr, "Example: %s ftp://ftp.up.pt/pub/gnu/emacs/elisp-manual-21-2.8.tar.gz\n", argv[0]);
+        fprintf(stderr, "Example: %s ftp://ftp.up.pt/pub/CPAN/README.html\n", argv[0]);
         exit(-1);
     }
     
@@ -279,12 +327,12 @@ int main(int argc, char **argv) {
         exit(-1);
     }
     
-    // Get IP address (reusing getip.c logic)
+    // Get IP address
     if (getIPAddress(urlInfo.host, ip) < 0) {
         exit(-1);
     }
     
-    // Connect to FTP server - control connection (reusing clientTCP.c logic)
+    // Connect to FTP server - control connection
     printf("\n--- Connecting to FTP server ---\n");
     control_sock = connectToServer(ip, FTP_PORT);
     if (control_sock < 0) {
@@ -292,41 +340,67 @@ int main(int argc, char **argv) {
     }
     
     // Read welcome message
-    readResponse(control_sock, buffer, sizeof(buffer));
-    if (buffer[0] != '2') {
-        fprintf(stderr, "Error: Failed to connect to server\n");
+    code = readResponse(control_sock, buffer, sizeof(buffer));
+    if (!isSuccessCode(code)) {
+        fprintf(stderr, "Error: Server didn't send welcome (code %d)\n", code);
         close(control_sock);
         exit(-1);
     }
     
-    // Send USER command
+    // autenticaÃ§Ã£o
     printf("\n--- Authentication ---\n");
+    
+    // Send USER command
     sendCommand(control_sock, "USER", urlInfo.user);
-    readResponse(control_sock, buffer, sizeof(buffer));
+    code = readResponse(control_sock, buffer, sizeof(buffer));
+    
+    if (isErrorCode(code)) {
+        fprintf(stderr, "Error: USER command failed (code %d): %s\n", 
+                code, getErrorMessage(code));
+        close(control_sock);
+        exit(-1);
+    }
     
     // Send PASS command
     sendCommand(control_sock, "PASS", urlInfo.password);
-    readResponse(control_sock, buffer, sizeof(buffer));
-    if (buffer[0] != '2') {
-        fprintf(stderr, "Error: Authentication failed\n");
+    code = readResponse(control_sock, buffer, sizeof(buffer));
+    
+    if (!isSuccessCode(code)) {
+        fprintf(stderr, "Error: Authentication failed (code %d)\n", code);
         close(control_sock);
         exit(-1);
     }
-    // Set binary mode
-    printf("\n--- Setting Binary Mode ---\n");
-    sendCommand(control_sock, "TYPE", "I");
-    readResponse(control_sock, buffer, sizeof(buffer));
-    if (buffer[0] != '2') {
-        fprintf(stderr, "Warning: Failed to set binary mode\n");
-        // continue (most dont need)
+    
+    // cwd
+    if (strlen(urlInfo.directory) > 0) {
+        printf("\n--- Changing Directory ---\n");
+        code = sendCommandCWD(control_sock, urlInfo.directory);
+        
+        if (!isSuccessCode(code)) {
+            fprintf(stderr, "Warning: CWD failed (code %d), will try full path in RETR\n", code);
+            // Does not exit -> try with full path in RETR
+            strcpy(urlInfo.filename, urlInfo.path);
+        } else {
+            printf("Changed to directory: %s\n", urlInfo.directory);
+        }
     }
     
-    // Enter passive mode
+    // set binary
+    printf("\n--- Setting Binary Mode ---\n");
+    sendCommand(control_sock, "TYPE", "I");
+    code = readResponse(control_sock, buffer, sizeof(buffer));
+    
+    if (!isSuccessCode(code)) {
+        fprintf(stderr, "Warning: TYPE I failed (code %d), continuing anyway\n", code);
+    }
+    
+    // passive mode
     printf("\n--- Entering Passive Mode ---\n");
     sendCommand(control_sock, "PASV", NULL);
-    readResponse(control_sock, buffer, sizeof(buffer));
-    if (buffer[0] != '2') {
-        fprintf(stderr, "Error: PASV command failed\n");
+    code = readResponse(control_sock, buffer, sizeof(buffer));
+    
+    if (!isSuccessCode(code)) {
+        fprintf(stderr, "Error: PASV command failed (code %d)\n", code);
         close(control_sock);
         exit(-1);
     }
@@ -337,7 +411,7 @@ int main(int argc, char **argv) {
         exit(-1);
     }
     
-    // Connect to data port (reusing clientTCP.c connection logic)
+    // open data connection
     printf("\n--- Opening Data Connection ---\n");
     data_sock = connectToServer(data_ip, data_port);
     if (data_sock < 0) {
@@ -345,45 +419,45 @@ int main(int argc, char **argv) {
         exit(-1);
     }
     
-    // Request file transfer
+    // request file
     printf("\n--- Requesting File Transfer ---\n");
-    sendCommand(control_sock, "RETR", urlInfo.path);
-    readResponse(control_sock, buffer, sizeof(buffer));
-    if (buffer[0] != '1') {
-        fprintf(stderr, "Error: RETR command failed\n");
+    sendCommand(control_sock, "RETR", urlInfo.filename);
+    code = readResponse(control_sock, buffer, sizeof(buffer));
+    
+    if (code < 100 || code >= 200) {
+        fprintf(stderr, "Error: RETR command failed (code %d)\n", code);
+        fprintf(stderr, "Server response: %s\n", buffer);
         close(data_sock);
         close(control_sock);
         exit(-1);
     }
     
-    // Download file
+    // download of the file
     printf("\n--- Downloading File ---\n");
-    if (downloadFile(data_sock, urlInfo.path) < 0) {
+    if (downloadFile(data_sock, urlInfo.filename) < 0) {
         close(data_sock);
         close(control_sock);
         exit(-1);
     }
     
     // Close data connection
-    if (close(data_sock) < 0) {
-        perror("close()");
-    }
+    close(data_sock);
     
     // Read transfer complete message
-    readResponse(control_sock, buffer, sizeof(buffer));
-    
-    // Send QUIT command
-    printf("\n--- Closing Connection ---\n");
-    sendCommand(control_sock, "QUIT", NULL);
-    readResponse(control_sock, buffer, sizeof(buffer));
-    
-    // Close control connection
-    if (close(control_sock) < 0) {
-        perror("close()");
-        exit(-1);
+    code = readResponse(control_sock, buffer, sizeof(buffer));
+    if (!isSuccessCode(code)) {
+        fprintf(stderr, "Warning: Transfer completion returned code %d\n", code);
     }
     
-    printf("\n Download Successful \n");
+    // exit
+    printf("\n--- Closing Connection ---\n");
+    sendCommand(control_sock, "QUIT", NULL);
+    code = readResponse(control_sock, buffer, sizeof(buffer));
+    
+    // Close control connection
+    close(control_sock);
+    
+    printf("\n --- Download Successful ---\n");
     
     return 0;
 }
