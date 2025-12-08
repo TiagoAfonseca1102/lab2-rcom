@@ -13,11 +13,18 @@
 // Format: ftp://[user:password@]host/path
 int parseURL(const char *url, URLInfo *info) {
     char temp[1024];
+    char temp2[1024];
     char *ptr;
     
     // Check if URL starts with ftp://
     if (strncmp(url, "ftp://", 6) != 0) {
         fprintf(stderr, "Error: URL must start with ftp://\n");
+        return -1;
+    }
+    
+    // Verifica tamanho do URL
+    if (strlen(url) > 1018) {
+        fprintf(stderr, "Error: URL too long\n");
         return -1;
     }
     
@@ -30,13 +37,18 @@ int parseURL(const char *url, URLInfo *info) {
         char *colon = strchr(temp, ':');
         if (colon != NULL) {
             *colon = '\0';
-            strcpy(info->user, temp);
-            strcpy(info->password, colon + 1);
+            strncpy(info->user, temp, sizeof(info->user) - 1);
+            info->user[sizeof(info->user) - 1] = '\0';
+            
+            strncpy(info->password, colon + 1, sizeof(info->password) - 1);
+            info->password[sizeof(info->password) - 1] = '\0';
         } else {
-            strcpy(info->user, temp);
+            strncpy(info->user, temp, sizeof(info->user) - 1);
+            info->user[sizeof(info->user) - 1] = '\0';
             strcpy(info->password, "");
         }
-        strcpy(temp, ptr + 1);
+        strcpy(temp2, ptr + 1);
+        strcpy(temp, temp2);
     } else {
         strcpy(info->user, "anonymous");
         strcpy(info->password, "anonymous@");
@@ -46,29 +58,35 @@ int parseURL(const char *url, URLInfo *info) {
     ptr = strchr(temp, '/');
     if (ptr != NULL) {
         *ptr = '\0';
-        strcpy(info->host, temp);
-        strcpy(info->path, ptr + 1);
+        strncpy(info->host, temp, sizeof(info->host) - 1);
+        info->host[sizeof(info->host) - 1] = '\0';
+        
+        strncpy(info->path, ptr + 1, sizeof(info->path) - 1);
+        info->path[sizeof(info->path) - 1] = '\0';
     } else {
-        strcpy(info->host, temp);
+        strncpy(info->host, temp, sizeof(info->host) - 1);
+        info->host[sizeof(info->host) - 1] = '\0';
         strcpy(info->path, "");
     }
     
     // Separate directory and filename
     char *last_slash = strrchr(info->path, '/');
-    if (last_slash != NULL && last_slash != info->path) {
+    if (last_slash != NULL) {
         // Has directory
         size_t dir_len = last_slash - info->path;
+        if (dir_len >= sizeof(info->directory)) {
+            dir_len = sizeof(info->directory) - 1;
+        }
         strncpy(info->directory, info->path, dir_len);
         info->directory[dir_len] = '\0';
-        strcpy(info->filename, last_slash + 1);
+        
+        strncpy(info->filename, last_slash + 1, sizeof(info->filename) - 1);
+        info->filename[sizeof(info->filename) - 1] = '\0';
     } else {
         // No directory, just filename
         strcpy(info->directory, "");
-        if (strlen(info->path) > 0) {
-            strcpy(info->filename, info->path);
-        } else {
-            strcpy(info->filename, "");
-        }
+        strncpy(info->filename, info->path, sizeof(info->filename) - 1);
+        info->filename[sizeof(info->filename) - 1] = '\0';
     }
     
     printf("Parsed URL:\n");
@@ -197,10 +215,11 @@ const char* getErrorMessage(int code) {
     return "Unknown error";
 }
 
-// send FTP command
+// send FTP command with complete write guarantee
 int sendCommand(int sockfd, const char *cmd, const char *arg) {
     char buffer[MAX_BUFFER];
-    size_t bytes;
+    size_t total = 0;
+    size_t len;
     
     if (arg != NULL && strlen(arg) > 0) {
         snprintf(buffer, sizeof(buffer), "%s %s\r\n", cmd, arg);
@@ -208,12 +227,17 @@ int sendCommand(int sockfd, const char *cmd, const char *arg) {
         snprintf(buffer, sizeof(buffer), "%s\r\n", cmd);
     }
     
+    len = strlen(buffer);
     printf("> %s", buffer);
     
-    bytes = write(sockfd, buffer, strlen(buffer));
-    if (bytes != strlen(buffer)) {
-        perror("write()");
-        return -1;
+    // Loop to guarantee complete write (may be partial)
+    while (total < len) {
+        ssize_t bytes = write(sockfd, buffer + total, len - total);
+        if (bytes <= 0) {
+            perror("write()");
+            return -1;
+        }
+        total += bytes;
     }
     
     return 0;
@@ -223,15 +247,21 @@ int sendCommand(int sockfd, const char *cmd, const char *arg) {
 int sendCommandCWD(int sockfd, const char *dir) {
     char buffer[MAX_BUFFER];
     char cmd[MAX_BUFFER];
+    size_t total = 0;
+    size_t len;
     
-    snprintf(cmd, sizeof(cmd), "CWD %s\r\n", dir);
+    len = snprintf(cmd, sizeof(cmd), "CWD %s\r\n", dir);
     
     printf("> CWD %s\n", dir);
     
-    // Send command
-    if (write(sockfd, cmd, strlen(cmd)) < 0) {
-        perror("write()");
-        return -1;
+    // complete write
+    while (total < len) {
+        ssize_t bytes = write(sockfd, cmd + total, len - total);
+        if (bytes <= 0) {
+            perror("write()");
+            return -1;
+        }
+        total += bytes;
     }
     
     // Read response
@@ -347,7 +377,7 @@ int main(int argc, char **argv) {
         exit(-1);
     }
     
-    // autenticação
+    // Authentication
     printf("\n--- Authentication ---\n");
     
     // Send USER command
@@ -371,21 +401,21 @@ int main(int argc, char **argv) {
         exit(-1);
     }
     
-    // cwd
+    // Change directory
     if (strlen(urlInfo.directory) > 0) {
         printf("\n--- Changing Directory ---\n");
         code = sendCommandCWD(control_sock, urlInfo.directory);
         
         if (!isSuccessCode(code)) {
             fprintf(stderr, "Warning: CWD failed (code %d), will try full path in RETR\n", code);
-            // Does not exit -> try with full path in RETR
+            // Does not exit -> try full path in RETR
             strcpy(urlInfo.filename, urlInfo.path);
         } else {
             printf("Changed to directory: %s\n", urlInfo.directory);
         }
     }
     
-    // set binary
+    // Set binary mode
     printf("\n--- Setting Binary Mode ---\n");
     sendCommand(control_sock, "TYPE", "I");
     code = readResponse(control_sock, buffer, sizeof(buffer));
@@ -405,13 +435,13 @@ int main(int argc, char **argv) {
         exit(-1);
     }
     
-    // Parse PASV response
+    //  PASV 
     if (parsePasvResponse(buffer, data_ip, &data_port) < 0) {
         close(control_sock);
         exit(-1);
     }
     
-    // open data connection
+    // Open data connection
     printf("\n--- Opening Data Connection ---\n");
     data_sock = connectToServer(data_ip, data_port);
     if (data_sock < 0) {
@@ -419,7 +449,7 @@ int main(int argc, char **argv) {
         exit(-1);
     }
     
-    // request file
+    
     printf("\n--- Requesting File Transfer ---\n");
     sendCommand(control_sock, "RETR", urlInfo.filename);
     code = readResponse(control_sock, buffer, sizeof(buffer));
@@ -432,7 +462,7 @@ int main(int argc, char **argv) {
         exit(-1);
     }
     
-    // download of the file
+    // Download the file
     printf("\n--- Downloading File ---\n");
     if (downloadFile(data_sock, urlInfo.filename) < 0) {
         close(data_sock);
@@ -449,7 +479,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Warning: Transfer completion returned code %d\n", code);
     }
     
-    // exit
+    // Quit
     printf("\n--- Closing Connection ---\n");
     sendCommand(control_sock, "QUIT", NULL);
     code = readResponse(control_sock, buffer, sizeof(buffer));
